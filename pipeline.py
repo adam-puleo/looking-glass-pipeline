@@ -1,24 +1,28 @@
 """
-apple_depth_to_lookingglass.py
+pipeline.py
 
-Converts an Apple iPhone portrait or depth-enabled photo to an MP4 that
-Looking Glass Studio can import directly as an RGB-D video.
+Converts an Apple iPhone portrait or depth-enabled photo to a JPG or an MP4
+that Looking Glass Studio can import as an RGB-D photo/video.
 
-The RGB-D format is a side-by-side video: color on the left half, grayscale
-depth on the right half.  Looking Glass Studio recognizes this when you import
-the file and select "RGB-D Photo/Video".
+The RGB-D format is a side-by-side image or video: color on the left half,
+grayscale depth on the right half. By default, a single JPG is produced
+(output_type "picture"); pass "video" to instead produce a looping MP4.
+Looking Glass Studio recognizes both when you import the file and select
+"RGB-D Photo/Video".
 
 Supports:
   - JPEG with MPF-embedded depth (portrait mode, "Most Compatible" setting)
   - HEIC with auxiliary depth images (requires pillow-heif)
 
 Usage:
-  python apple_depth_to_lookingglass.py input.jpg output.mp4
-  python apple_depth_to_lookingglass.py input.heic output.mp4
-  python apple_depth_to_lookingglass.py input.jpg output.mp4 --duration 30
-  python apple_depth_to_lookingglass.py input.jpg output.mp4 --codec h265
-  python apple_depth_to_lookingglass.py input.jpg output.mp4 --max-width 1920
-  python apple_depth_to_lookingglass.py input.jpg output.mp4 --invert-depth
+  python pipeline.py input.jpg output_dir/
+  python pipeline.py input.heic output_dir/
+  python pipeline.py picture input.jpg output_dir/ --max-width 1920
+  python pipeline.py video input.jpg output_dir/ --duration 10 --codec h265 --crf 22
+  python pipeline.py input.jpg output_dir/ --invert-depth
+
+  output_type ("picture" or "video") is optional and defaults to "picture".
+  --duration/--codec/--crf are required when output_type is "video".
 
 Requirements:
   pip install Pillow numpy
@@ -65,7 +69,7 @@ class PipelineArgs(BaseModel):
     save_intermediates: bool
 
     # Video
-    duration: int
+    duration: float
     codec: CodecTypes
     crf: Optional[int]
 
@@ -80,7 +84,7 @@ class ProcessFileParams(BaseModel):
     invert_depth: bool
     blur: float
     save_intermediates: bool
-    duration: int
+    duration: float
     codec: Literal['auto', 'h264', 'h265', 'hevc_videotoolbox']
     crf_h264: Optional[int]
     crf_h265: Optional[int]
@@ -142,7 +146,7 @@ def find_jpeg_markers(data):
     return markers
 
 
-def parse_mpf(data, app2_offset, app2_length):
+def parse_mpf(data, app2_offset):
     """
     Parse the MPF (Multi-Picture Format) APP2 block.
     Returns a list of dicts: {index, offset, length, flags}
@@ -156,12 +160,12 @@ def parse_mpf(data, app2_offset, app2_length):
     big_endian = (byte_order == b'MM')
 
     def r16(off):
-        raw = data[base + off: base + off + 2]
-        return struct.unpack('>H' if big_endian else '<H', raw)[0]
+        chunk = data[base + off: base + off + 2]
+        return struct.unpack('>H' if big_endian else '<H', chunk)[0]
 
     def r32(off):
-        raw = data[base + off: base + off + 4]
-        return struct.unpack('>I' if big_endian else '<I', raw)[0]
+        chunk = data[base + off: base + off + 4]
+        return struct.unpack('>I' if big_endian else '<I', chunk)[0]
 
     ifd_offset = r32(4)          # offset to IFD from base
     entry_count = r16(ifd_offset)
@@ -184,7 +188,6 @@ def parse_mpf(data, app2_offset, app2_length):
     mp_data_ptr = r32(mp_entry_offset)
 
     images = []
-    img_offset_in_ifd = ifd_offset + 2 + entry_count * 12 + 4  # skip next IFD ptr
 
     # The actual MP Entries live at mp_data_ptr from base
     ptr = mp_data_ptr
@@ -288,7 +291,7 @@ def extract_depth_jpeg_mpf(jpeg_data, tag: str):
     if app2_info is None:
         raise ValueError("No MPF block found in JPEG – not an Apple depth photo?")
 
-    mp_images = parse_mpf(jpeg_data, app2_info[0], app2_info[1])
+    mp_images = parse_mpf(jpeg_data, app2_info[0])
 
     if len(mp_images) < 2:
         raise ValueError(
@@ -457,12 +460,15 @@ def scale_image(img: PIL.Image.Image, max_width: int, max_height: int):
     """
     Downscale img so that it fits within max_width x max_height,
     preserving the aspect ratio.  Returns the image unchanged if it
-    already fits.
+    already fits. A max_width or max_height of 0 (or less) means "no
+    limit" on that axis.
     """
     w, h = img.size
-    if w <= max_width and h <= max_height:
+    eff_max_width = max_width if max_width > 0 else w
+    eff_max_height = max_height if max_height > 0 else h
+    if w <= eff_max_width and h <= eff_max_height:
         return img
-    scale = min(max_width / w, max_height / h)
+    scale = min(eff_max_width / w, eff_max_height / h)
     new_w = int(w * scale)
     new_h = int(h * scale)
     return img.resize((new_w, new_h), Image.Resampling.BICUBIC)
@@ -519,7 +525,11 @@ def icc_to_ffmpeg_color_params(icc_bytes):
     try:
         profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
         desc = ImageCms.getProfileDescription(profile).strip().lower()
-    except Exception:
+    except Exception as exc:
+        # ICC bytes can be malformed/truncated in ways ImageCms doesn't
+        # document; fall back to bt709 rather than let one bad profile
+        # abort the whole file.
+        logger.debug(f"Failed to read ICC profile, defaulting to bt709: {exc}")
         return 'bt709', 'bt709', 'bt709'
 
     if 'display p3' in desc or 'p3-d65' in desc:
@@ -530,26 +540,88 @@ def icc_to_ffmpeg_color_params(icc_bytes):
     return 'bt709', 'bt709', 'bt709'
 
 
-def encode_mp4(
+def _run_ffmpeg(cmd: List[str], tag: str, output_file: Path) -> None:
+    """Run an FFmpeg command, raising on failure and logging the result size."""
+    logger.info(f"{tag}   Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        logger.error(f"{tag}   FFmpeg stderr: {result.stderr}")
+        raise RuntimeError(f"FFmpeg failed with return code {result.returncode}")
+
+    size_mb = os.path.getsize(output_file) / (1024 * 1024)
+    logger.info(f"{tag}   FFmpeg finished → {output_file}  ({size_mb:.1f} MB)")
+
+
+def encode_picture(
+        rgbd_img: PIL.Image.Image,
         output_file: Path,
         tag: str,
-        rgbd_img: PIL.Image.Image | None = None,
-        rgb_img: PIL.Image.Image | None = None,
-        depth_rgb: PIL.Image.Image | None = None,
-        duration: int=10,
-        codec='auto',
-        crf: Optional[int]=None,
         colorspace='bt709',
         color_primaries='bt709',
         color_trc='bt709',
         extra_ffmpeg_args=None,
 ):
     """
-    Encode the RGB-D PIL image as an MP4 that Looking Glass Studio can import
-    directly as an RGB-D video.
+    Encode the RGB-D PIL image as a JPG that Looking Glass Studio can import
+    as an RGB-D photo.
 
     Args:
         rgbd_img:          PIL.Image — side-by-side RGB-D canvas.
+        output_file:       File, including a path, to write output in.
+        tag:               Name of the file currently being processed. Used
+                           for generating per-file log messages.
+        colorspace:        FFmpeg colorspace tag, derived from the source's
+                           ICC profile (default 'bt709').
+        color_primaries:   FFmpeg color_primaries tag, likewise ICC-derived.
+        color_trc:         FFmpeg color_trc tag, likewise ICC-derived.
+        extra_ffmpeg_args: Optional list of additional FFmpeg flags appended
+                           before the output path.
+    """
+    w, h = rgbd_img.size
+    logger.info(f"{tag}   Canvas: {w}x{h} px")
+
+    # Write the RGB-D canvas to a temporary lossless PNG so FFmpeg gets the
+    # exact pixels without any intermediate JPEG re-compression loss.
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+        rgbd_path = tmp.name
+        rgbd_img.save(rgbd_path, format='PNG')
+
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-colorspace',      colorspace,
+            '-color_primaries', color_primaries,
+            '-color_trc',       color_trc,
+            '-i', rgbd_path,
+            '-q:v', '2',  # high-quality JPEG
+        ]
+        if extra_ffmpeg_args:
+            cmd += extra_ffmpeg_args
+        cmd.append(str(output_file))
+
+        _run_ffmpeg(cmd, tag, output_file)
+    finally:
+        os.unlink(rgbd_path)
+
+
+def encode_video(
+        rgb_img: PIL.Image.Image,
+        depth_rgb: PIL.Image.Image,
+        output_file: Path,
+        tag: str,
+        duration: float=10,
+        codec='auto',
+        crf: Optional[int]=None,
+        extra_ffmpeg_args=None,
+):
+    """
+    Encode color + depth as an MP4 that Looking Glass Studio can import
+    directly as an RGB-D video.
+
+    Args:
+        rgb_img:           PIL.Image — color frame.
+        depth_rgb:         PIL.Image — depth frame, same size as rgb_img.
         output_file:       File, including a path, to write output in.
         tag:               Name of the file currently being processed. Used
                            for generating per-file log messages.
@@ -567,135 +639,82 @@ def encode_mp4(
     The output is always yuv420p, 30 fps, with the -movflags +faststart flag
     set, so the file is streamable and compatible with all Looking Glass players.
     """
-    if rgbd_img is not None:
-        # Generating a picture
-        output_video = False
-        w, h = rgbd_img.size
-        # Write the RGB-D canvas to a temporary lossless PNG so FFmpeg gets the
-        # exact pixels without any intermediate JPEG re-compression loss.
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            rgbd_path = tmp.name
-            rgbd_img.save(rgbd_path, format='PNG')
+    rgb_w, rgb_h = rgb_img.size
+    d_rgb_w, d_rgb_h = depth_rgb.size
+    if rgb_w != d_rgb_w or rgb_h != d_rgb_h:
+        raise ValueError('rgb_img and depth_rgb must be the same size.')
 
-    elif rgb_img is None or depth_rgb is None:
-        raise ValueError('Either rgbd_img or (rgb_img and depth_rgb) must be provided.')
-
-    else:
-        # Generating a video
-        output_video = True
-        rgb_w, rgb_h = rgb_img.size
-        d_rgb_w, d_rgb_h = depth_rgb.size
-        if rgb_w != d_rgb_w or rgb_h != d_rgb_h:
-            raise ValueError('rgb_img and depth_rgb must be the same size.')
-
-        w = rgb_w
-        h = rgb_h
-
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            rgb_path = tmp.name
-            rgb_img.save(rgb_path, format='PNG')
-
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            depth_rgb_path = tmp.name
-            depth_rgb.save(depth_rgb_path, format='PNG')
-
+    w, h = rgb_w, rgb_h
     total_pixels = w * h
 
-    if output_video:
-        # Resolve codec choice
-        if codec == 'auto':
-            codec = 'h265' if total_pixels >= _H265_PIXEL_THRESHOLD else 'h264'
+    # Resolve codec choice
+    if codec == 'auto':
+        codec = 'h265' if total_pixels >= _H265_PIXEL_THRESHOLD else 'h264'
 
-        match codec:
-            case 'h264':
-                encoder = 'libx264'
-                crf = 18 if crf is None else crf
-                vcodec_params = [
-                    '-vcodec',    encoder,
-                    '-profile:v', 'baseline',
-                    '-level',     '3.1',
-                    '-crf',       str(crf),
-                ]
-            case 'h265':
-                encoder = 'libx265'
-                crf = 22 if crf is None else crf
-                vcodec_params = [
-                    '-vcodec', encoder,
-                    '-profile:v', 'baseline',
-                    '-level',     '3.1',
-                    '-crf',    str(crf),
-                ]
-            case 'hevc_videotoolbox':
-                encoder = 'hevc_videotoolbox'  # Apple HW encoder
-                bitrate = '35511k'  # VideoToolbox uses target bitrate, not CRF
-                vcodec_params = [
-                    '-vcodec', encoder,
-                    # '-b:v',    bitrate,
-                    '-q:v',    '100',  # 1 = worst, 100 = best
-                    # '-tag:v',  'hev1',  # Don't add the Apple tag.
-                ]
-            case _:
-                raise ValueError(f"Unknown codec: {codec}")
-        logger.info(f"{tag}   Canvas: {w}x{h} px  →  encoding as {encoder}, duration={duration}s, crf={crf}")
-    else:
-        logger.info(f"{tag}   Canvas: {w}x{h} px")
+    match codec:
+        case 'h264':
+            encoder = 'libx264'
+            crf = 18 if crf is None else crf
+            vcodec_params = [
+                '-vcodec',    encoder,
+                '-profile:v', 'baseline',
+                '-level',     '3.1',
+                '-crf',       str(crf),
+            ]
+        case 'h265':
+            encoder = 'libx265'
+            crf = 22 if crf is None else crf
+            vcodec_params = [
+                '-vcodec', encoder,
+                '-profile:v', 'baseline',
+                '-level',     '3.1',
+                '-crf',    str(crf),
+            ]
+        case 'hevc_videotoolbox':
+            encoder = 'hevc_videotoolbox'  # Apple HW encoder
+            vcodec_params = [
+                '-vcodec', encoder,
+                # '-b:v',    '35511k',  # VideoToolbox uses target bitrate, not CRF
+                '-q:v',    '100',  # 1 = worst, 100 = best
+                '-tag:v',  'hev1',  # Don't add the Apple tag.
+            ]
+        case _:
+            raise ValueError(f"Unknown codec: {codec}")
+    logger.info(f"{tag}   Canvas: {w}x{h} px  →  encoding as {encoder}, duration={duration}s, crf={crf}")
+
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+        rgb_path = tmp.name
+        rgb_img.save(rgb_path, format='PNG')
+
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+        depth_rgb_path = tmp.name
+        depth_rgb.save(depth_rgb_path, format='PNG')
 
     try:
         cmd = [
             'ffmpeg', '-y',
+            '-stream_loop', '-1',
+            '-i',           rgb_path,
+            '-stream_loop', '-1',
+            '-i',           depth_rgb_path,
         ]
-        if output_video:
-            cmd += [
-                '-stream_loop', '-1',
-                '-i',           rgb_path,
-                '-stream_loop', '-1',
-                '-i',           depth_rgb_path,
-            ]
-        else:
-            cmd += [
-                # '-colorspace',      colorspace,
-                # '-color_primaries', color_primaries,
-                # '-color_trc',       color_trc,
-                '-i', rgbd_path,
-            ]
-
-        if output_video:
-            cmd += vcodec_params
-            cmd += [
-                # '-color_range',     'tv',
-                # '-pix_fmt',         'yuv420p',  # universal compatibility; required by LKG
-                # '-vf',              'setsar=1/2',  # tells the player to display 3072px wide as 1536px wide
-                # '-vf',              'scale=in_range=full:out_range=limited,setsar=1/2,fps=30,format=yuv420p',
-                '-filter_complex',  'hstack,format=yuv420p',
-                # '-movflags',        '+faststart',
-                # '-r',               '30',
-                # Encode for exactly `duration` seconds
-                '-t',               str(duration),
-            ]
-        else:
-            cmd += ['-q:v', '2']  # high-quality JPEG
-
+        cmd += vcodec_params
+        cmd += [
+            '-color_range',     'tv',
+            '-filter_complex',  'hstack,format=yuv420p',  # universal compatibility; required by LKG
+            '-r',               '30',
+            '-movflags',        '+faststart',
+            # Encode for exactly `duration` seconds
+            '-t',               str(duration),
+        ]
         if extra_ffmpeg_args:
             cmd += extra_ffmpeg_args
-
         cmd.append(str(output_file))
 
-        logger.info(f"{tag}   Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            logger.error(f"{tag}   FFmpeg stderr: {result.stderr}")
-            raise RuntimeError(f"FFmpeg failed with return code {result.returncode}")
-
-        size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        logger.info(f"{tag}   FFmpeg finished → {output_file}  ({size_mb:.1f} MB)")
-
+        _run_ffmpeg(cmd, tag, output_file)
     finally:
-        if output_video:
-            os.unlink(rgb_path)
-            os.unlink(depth_rgb_path)
-        else:
-            os.unlink(rgbd_path)
+        os.unlink(rgb_path)
+        os.unlink(depth_rgb_path)
 
 
 def parse_args() -> PipelineArgs:
@@ -720,8 +739,9 @@ def parse_args() -> PipelineArgs:
     parser.add_argument(
         'output_type',
         type=str,
+        nargs='?',
         choices=get_args(OutputTypes), default='picture',
-        help=f'Type of output file {get_args(OutputTypes)} to create.',
+        help=f'Type of output file {get_args(OutputTypes)} to create (default: picture).',
     )
     parser.add_argument(
         'input',
@@ -777,7 +797,7 @@ def parse_args() -> PipelineArgs:
         )
     )
     parser.add_argument(
-        '--duration', type=int, default=None, metavar='SECONDS',
+        '--duration', type=float, default=None, metavar='SECONDS',
         help=(
             'Length of the output video in seconds. Required when output_type '
             'is "mp4". Looking Glass Studio loops playlist items, so a short '
@@ -829,7 +849,7 @@ def parse_args() -> PipelineArgs:
         output_type=raw.output_type,
         input=raw.input,
         output=raw.output,
-        duration=raw.duration if raw.duration is not None else 10,
+        duration=raw.duration if raw.duration is not None else 10.0,
         codec=raw.codec if raw.codec is not None else 'hevc_videotoolbox',
         max_width=raw.max_width,
         max_height=raw.max_height,
@@ -916,8 +936,8 @@ def process_file(
         logger.info(f"{tag}   Scaled color to: {color_img.size}")
 
     # --- Retrieve colorspace and color_primaries from ICC profile ---
-    # colorspace, color_primaries, color_trc = icc_to_ffmpeg_color_params(icc_profile)
-    # logger.info(f"{tag}   Color params from ICC: colorspace={colorspace} primaries={color_primaries} trc={color_trc}")
+    colorspace, color_primaries, color_trc = icc_to_ffmpeg_color_params(icc_profile)
+    logger.info(f"{tag}   Color params from ICC: colorspace={colorspace} primaries={color_primaries} trc={color_trc}")
 
     # --- Resize / smooth / invert depth map ---
     depth_rgb = process_depth(
@@ -928,6 +948,12 @@ def process_file(
     )
     logger.info(f"{tag}   Resized depth to: {depth_rgb.size}")
 
+    # --- Enforce even dimensions (required for yuv420p encoding) on both
+    # halves, whether they're composited into one canvas (picture) or fed to
+    # FFmpeg as two separate video inputs (video) ---
+    color_img = enforce_even(color_img)
+    depth_rgb = enforce_even(depth_rgb)
+
     # --- Save intermediates if requested ---
     if params.save_intermediates:
         base = output_file.with_suffix('')
@@ -935,26 +961,39 @@ def process_file(
         depth_rgb.save(str(base) + '_depth.png')
         logger.info(f"{tag}   Saved intermediates: {base}_color.png, {base}_depth.png")
 
-    rgbd = None
+    # --- Encode to desired output format ---
     if params.output_type == 'picture':
         # --- Build side-by-side RGB-D canvas ---
         rgbd = build_rgbd(color_img, depth_rgb)
         logger.info(f"{tag}   RGB-D canvas: {rgbd.size}")
 
-    # --- Encode to desired output format ---
-    encode_mp4(
-        rgbd_img=rgbd,
-        rgb_img=color_img,
-        depth_rgb=depth_rgb,
-        output_file=output_file,
-        tag=tag,
-        duration=params.duration,
-        codec=params.codec,
-        extra_ffmpeg_args=params.ffmpeg_args,
-        # colorspace=colorspace,
-        # color_primaries=color_primaries,
-        # color_trc=color_trc,
-    )
+        encode_picture(
+            rgbd_img=rgbd,
+            output_file=output_file,
+            tag=tag,
+            colorspace=colorspace,
+            color_primaries=color_primaries,
+            color_trc=color_trc,
+            extra_ffmpeg_args=params.ffmpeg_args,
+        )
+    else:
+        # crf_h264/crf_h265 both fold in the user's --crf override, so
+        # they're equal when --crf was passed explicitly. When it wasn't,
+        # they hold the different per-codec defaults (18/22), and which one
+        # applies depends on which codec encode_video resolves 'auto' to —
+        # so leave crf unset here and let encode_video apply the right
+        # default for whichever codec it picks.
+        crf = params.crf_h264 if params.crf_h264 == params.crf_h265 else None
+        encode_video(
+            rgb_img=color_img,
+            depth_rgb=depth_rgb,
+            output_file=output_file,
+            tag=tag,
+            duration=params.duration,
+            codec=params.codec,
+            crf=crf,
+            extra_ffmpeg_args=params.ffmpeg_args,
+        )
 
     logger.info(f"{tag} Done → {output_file}")
 
@@ -989,8 +1028,8 @@ def main():
     ]
 
     if not pairs:
-        logger.error("No input files found.")
-        sys.exit(1)
+        logger.warning("No input files found.")
+        sys.exit(0)
 
     # Collect encoding parameters into a plain dict so it can be pickled and
     # sent to worker processes by ProcessPoolExecutor.
